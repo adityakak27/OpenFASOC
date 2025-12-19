@@ -1,11 +1,7 @@
 import sys
 import os
-# Add the glayout package root to Python path so imports work when running script directly
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-_glayout_root = os.path.abspath(os.path.join(_script_dir, '..', '..', '..', '..', '..'))
-if _glayout_root not in sys.path:
-    sys.path.insert(0, _glayout_root)
-
+import json
+import glayout
 from glayout.flow.pdk.mappedpdk import MappedPDK
 from glayout.flow.pdk.sky130_mapped import sky130_mapped_pdk
 from gdsfactory.cell import cell
@@ -28,6 +24,53 @@ try:
 except ImportError:
     print("Warning: evaluator_wrapper not found. Evaluation will be skipped.")
     run_evaluation = None
+
+def reconstruct_netlist_from_component(component, comp_name):
+    """Helper to safely extract and reconstruct netlist from component"""
+    try:
+        netlist = component.info.get('netlist', None)
+        
+        if isinstance(netlist, Netlist):
+            return netlist
+        
+        if isinstance(netlist, str):
+            netlist_data_json = component.info.get('netlist_data_json', None)
+            
+            if netlist_data_json:
+                try:
+                    data = json.loads(netlist_data_json)
+                    reconstructed = Netlist(
+                        circuit_name=data.get('circuit_name', 'unknown'),
+                        nodes=data.get('nodes', ['D', 'G', 'S', 'B'])
+                    )
+                    reconstructed.source_netlist = data.get('source_netlist', '')
+                    if 'parameters' in data:
+                        reconstructed.parameters = data['parameters']
+                    return reconstructed
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Debug: JSON decode failed for {comp_name}: {e}")
+            
+            netlist_data = component.info.get('netlist_data', None)
+            if netlist_data and isinstance(netlist_data, dict):
+                try:
+                    reconstructed = Netlist(
+                        circuit_name=netlist_data.get('circuit_name', 'unknown'),
+                        nodes=netlist_data.get('nodes', ['D', 'G', 'S', 'B'])
+                    )
+                    reconstructed.source_netlist = netlist_data.get('source_netlist', '')
+                    if 'parameters' in netlist_data:
+                        reconstructed.parameters = netlist_data['parameters']
+                    return reconstructed
+                except (KeyError, TypeError) as e:
+                    print(f"Debug: netlist_data parse failed for {comp_name}: {e}")
+            
+            raise ValueError(f"No netlist_data found for string netlist in {comp_name} component")
+        
+        raise ValueError(f"Invalid netlist for {comp_name}")
+        
+    except Exception as e:
+        print(f"Error reconstructing netlist for {comp_name}: {e}")
+        raise
 
 def add_tg_labels(tg_in: Component,
                         pdk: MappedPDK
@@ -76,50 +119,31 @@ def add_tg_labels(tg_in: Component,
         tg_in.add(compref)
     return tg_in.flatten() 
 
-
-def get_component_netlist(component) -> Netlist:
-    """Helper function to extract netlist from component with version compatibility"""
-    if hasattr(component.info, 'get'):        
-        # Check if netlist object is stored directly 
-        if 'netlist' in component.info:
-            netlist_obj = component.info['netlist']
-            if isinstance(netlist_obj, str):
-                # It's a string representation, try to reconstruct
-                # For gymnasium compatibility, we don't store netlist_data, so create a simple netlist
-                return Netlist(source_netlist=netlist_obj)
-            else:
-                # It's already a Netlist object
-                return netlist_obj
+def tg_netlist(nfet_comp: Component, pfet_comp: Component) -> Netlist:
+    """Generate netlist for transmission gate using proper Netlist class
     
-    # Fallback: return empty netlist
-    return Netlist()
-
-def tg_netlist(nfet_comp, pfet_comp) -> str:
-    """Generate SPICE netlist string for transmission gate - gymnasium compatible"""
+    Port names match the labels added by add_tg_labels:
+    VIN (source), VOUT (drain), VGP (pmos gate), VGN (nmos gate), VCC (pwell/vdd), VSS (nwell/gnd)
+    """
+    tg_netlist_obj = Netlist(circuit_name='transmission_gate', nodes=['VIN', 'VOUT', 'VGP', 'VGN', 'VCC', 'VSS'])
     
-    # Get the SPICE netlists directly from components
-    nmos_spice = nfet_comp.info.get('netlist', '')
-    pmos_spice = pfet_comp.info.get('netlist', '')
+    # Reconstruct netlists for both FETs
+    nfet_netlist = reconstruct_netlist_from_component(nfet_comp, "nfet")
+    pfet_netlist = reconstruct_netlist_from_component(pfet_comp, "pfet")
     
-    if not nmos_spice or not pmos_spice:
-        raise ValueError("Component netlists not found")
+    # Connect NMOS: drain=VOUT, gate=VGN, source=VIN, bulk=VSS
+    tg_netlist_obj.connect_netlist(
+        nfet_netlist,
+        [('D', 'VOUT'), ('G', 'VGN'), ('S', 'VIN'), ('B', 'VSS')]
+    )
     
-    # Create the transmission gate SPICE netlist by combining the primitives
-    # Port names must match the labels added by add_tg_labels:
-    # VIN (source), VOUT (drain), VGP (pmos gate), VGN (nmos gate), VCC (pwell/vdd), VSS (nwell/gnd)
-    tg_spice = f"""{nmos_spice}
-
-{pmos_spice}
-
-.subckt transmission_gate VOUT VGP VGN VIN VCC VSS
-* PMOS: connects VOUT to VIN when VGP is low  
-X0 VOUT VGP VIN VCC PMOS
-* NMOS: connects VOUT to VIN when VGN is high
-X1 VOUT VGN VIN VSS NMOS
-.ends transmission_gate
-"""
+    # Connect PMOS: drain=VOUT, gate=VGP, source=VIN, bulk=VCC
+    tg_netlist_obj.connect_netlist(
+        pfet_netlist,
+        [('D', 'VOUT'), ('G', 'VGP'), ('S', 'VIN'), ('B', 'VCC')]
+    )
     
-    return tg_spice
+    return tg_netlist_obj
 
 @cell
 def transmission_gate(
@@ -173,12 +197,20 @@ def transmission_gate(
             top_level.add_ports(guardring_ref.get_ports_list(),prefix="tap_")
     
     component = component_snap_to_grid(rename_ports_by_orientation(top_level)) 
-    # Generate netlist as SPICE string for gymnasium compatibility
-    netlist_string = tg_netlist(nfet, pfet)
     
-    # Store as string for gymnasium compatibility - LVS method supports this directly
-    component.info['netlist'] = netlist_string
-
+    # Generate netlist using proper Netlist class
+    tg_netlist_obj = tg_netlist(nfet, pfet)
+    
+    # Store Netlist object (mappedpdk.lvs_netgen expects object with generate_netlist method)
+    component.info['netlist'] = tg_netlist_obj
+    
+    # Store netlist_data as JSON for reconstruction
+    component.info['netlist_data_json'] = json.dumps({
+        'circuit_name': tg_netlist_obj.circuit_name,
+        'nodes': tg_netlist_obj.nodes,
+        'source_netlist': tg_netlist_obj.source_netlist,
+        'parameters': tg_netlist_obj.parameters if hasattr(tg_netlist_obj, 'parameters') else {}
+    })
 
     return component
 
@@ -189,4 +221,7 @@ if __name__=="__main__":
     #magic_drc_result = sky130_mapped_pdk.drc_magic(transmission_gate, transmission_gate.name)
     #netgen_lvs_result = sky130_mapped_pdk.lvs_netgen(transmission_gate, transmission_gate.name)
     transmission_gate_gds = transmission_gate.write_gds("transmission_gate.gds")
-    res = run_evaluation("transmission_gate.gds", transmission_gate.name, transmission_gate)
+    if run_evaluation is not None:
+        res = run_evaluation("transmission_gate.gds", transmission_gate.name, transmission_gate)
+    else:
+        print("Skipping evaluation: evaluator_wrapper not available")
