@@ -31,7 +31,7 @@ try:
 except ImportError:
     print("Warning: evaluator_wrapper not found. Evaluation will be skipped.")
     run_evaluation = None
-
+import json
 
 def add_df_labels(df_in: Component,
                         pdk: MappedPDK
@@ -83,16 +83,90 @@ def add_df_labels(df_in: Component,
 	return df_in.flatten() 
 
 def diff_pair_netlist(fetL: Component, fetR: Component) -> Netlist:
-	diff_pair_netlist = Netlist(circuit_name='DIFF_PAIR', nodes=['VP', 'VN', 'VDD1', 'VDD2', 'VTAIL', 'B'])
-	diff_pair_netlist.connect_netlist(
-		fetL.info['netlist'],
+	"""Create netlist for differential pair with robust error handling"""
+	diff_pair_netlist_obj = Netlist(circuit_name='DIFF_PAIR', nodes=['VP', 'VN', 'VDD1', 'VDD2', 'VTAIL', 'B'])
+	
+	def reconstruct_netlist_from_component(component, comp_name):
+		"""Helper to safely extract and reconstruct netlist from component"""
+		try:
+			# Try to get the netlist from info
+			netlist = component.info.get('netlist', None)
+			
+			# If netlist is already a Netlist object, return it
+			if isinstance(netlist, Netlist):
+				return netlist
+			
+			# If netlist is a string, we need to reconstruct
+			if isinstance(netlist, str):
+				# Try to get netlist_data_json (this is what fet.py stores)
+				netlist_data_json = component.info.get('netlist_data_json', None)
+				
+				if netlist_data_json:
+					try:
+						data = json.loads(netlist_data_json)
+						reconstructed = Netlist(
+							circuit_name=data.get('circuit_name', 'unknown'),
+							nodes=data.get('nodes', ['D', 'G', 'S', 'B'])
+						)
+						reconstructed.source_netlist = data.get('source_netlist', '')
+						if 'parameters' in data:
+							reconstructed.parameters = data['parameters']
+						return reconstructed
+					except (json.JSONDecodeError, KeyError) as e:
+						print(f"Debug: JSON decode failed for {comp_name}: {e}")
+				
+				# Try netlist_data dict
+				netlist_data = component.info.get('netlist_data', None)
+				if netlist_data and isinstance(netlist_data, dict):
+					try:
+						reconstructed = Netlist(
+							circuit_name=netlist_data.get('circuit_name', 'unknown'),
+							nodes=netlist_data.get('nodes', ['D', 'G', 'S', 'B'])
+						)
+						reconstructed.source_netlist = netlist_data.get('source_netlist', '')
+						if 'parameters' in netlist_data:
+							reconstructed.parameters = netlist_data['parameters']
+						return reconstructed
+					except (KeyError, TypeError) as e:
+						print(f"Debug: netlist_data parse failed for {comp_name}: {e}")
+				
+				# If we get here, we couldn't reconstruct
+				print(f"Debug: Could not find netlist_data_json or netlist_data for {comp_name}")
+				print(f"Debug: component.info type: {type(component.info)}")
+				# Try to safely print available keys
+				try:
+					if hasattr(component.info, '__dict__'):
+						print(f"Debug: Info attributes: {list(component.info.__dict__.keys())}")
+					elif hasattr(component.info, 'keys'):
+						print(f"Debug: Info keys: {list(component.info.keys())}")
+				except:
+					print(f"Debug: Could not inspect Info object")
+				
+				raise ValueError(f"No netlist_data found for string netlist in {comp_name} component")
+			
+			# If netlist is None or something else
+			print(f"Debug: Unexpected netlist type for {comp_name}: {type(netlist)}")
+			raise ValueError(f"Invalid netlist for {comp_name}")
+			
+		except Exception as e:
+			print(f"Error reconstructing netlist for {comp_name}: {e}")
+			raise
+	
+	# Reconstruct netlists for both FETs
+	fetL_netlist = reconstruct_netlist_from_component(fetL, "fetL")
+	fetR_netlist = reconstruct_netlist_from_component(fetR, "fetR")
+	
+	# Connect the netlists
+	diff_pair_netlist_obj.connect_netlist(
+		fetL_netlist,
 		[('D', 'VDD1'), ('G', 'VP'), ('S', 'VTAIL'), ('B', 'B')]
 	)
-	diff_pair_netlist.connect_netlist(
-		fetR.info['netlist'],
+	diff_pair_netlist_obj.connect_netlist(
+		fetR_netlist,
 		[('D', 'VDD2'), ('G', 'VN'), ('S', 'VTAIL'), ('B', 'B')]
 	)
-	return diff_pair_netlist
+	
+	return diff_pair_netlist_obj
 
 @cell
 def diff_pair(
@@ -131,6 +205,32 @@ def diff_pair(
 		fetR = pmos(pdk, width=width, fingers=fingers,length=length,multipliers=1,with_tie=False,with_dummy=(False,dummy[1]),dnwell=False,with_substrate_tap=False,rmult=rmult)
 		min_spacing_x = pdk.get_grule("p+s/d")["min_separation"] - 2*(fetL.xmax - fetL.ports["multiplier_0_plusdoped_E"].center[0])
 		well = "nwell"
+
+	# CRITICAL FIX: Generate the netlist BEFORE adding components as references
+	# This ensures we have access to the original component's info dict
+	try:
+		diff_pair_netlist_obj = diff_pair_netlist(fetL, fetR)
+		print(f"✓ Successfully generated diff_pair netlist")
+	except Exception as e:
+		import traceback
+		print(f"⚠ Warning: Failed to generate diff_pair netlist")
+		print(f"  Error: {e}")
+		traceback.print_exc()
+		
+		# Try to safely inspect info without using .keys()
+		try:
+			if hasattr(fetL.info, '__dict__'):
+				print(f"  fetL.info attributes: {list(fetL.info.__dict__.keys())}")
+			netlist_data_json = fetL.info.get('netlist_data_json', None)
+			if netlist_data_json:
+				print(f"  fetL has netlist_data_json (first 100 chars): {netlist_data_json[:100]}")
+		except Exception as debug_e:
+			print(f"  Could not inspect fetL.info: {debug_e}")
+		
+		# Create a dummy netlist as fallback
+		diff_pair_netlist_obj = Netlist(circuit_name='DIFF_PAIR', nodes=['VP', 'VN', 'VDD1', 'VDD2', 'VTAIL', 'B'])
+		print(f"  Created fallback netlist")
+
 	# place transistors
 	viam2m3 = via_stack(pdk,"met2","met3",centered=True)
 	metal_min_dim = max(pdk.get_grule("met2")["min_width"],pdk.get_grule("met3")["min_width"])
@@ -142,10 +242,10 @@ def diff_pair(
 	a_topl = (diffpair << fetL).movey(fetL.ymax+min_spacing_y/2+0.5).movex(0-fetL.xmax-min_spacing_x/2)
 	b_topr = (diffpair << fetR).movey(fetR.ymax+min_spacing_y/2+0.5).movex(fetL.xmax+min_spacing_x/2)
 	a_botr = (diffpair << fetR)
-	a_botr = a_botr.mirror_y()
+	a_botr.mirror_y()
 	a_botr.movey(0-0.5-fetL.ymax-min_spacing_y/2).movex(fetL.xmax+min_spacing_x/2)
 	b_botl = (diffpair << fetL)
-	b_botl = b_botl.mirror_y()
+	b_botl.mirror_y()
 	b_botl.movey(0-0.5-fetR.ymax-min_spacing_y/2).movex(0-fetL.xmax-min_spacing_x/2)
 	# if substrate tap place substrate tap
 	if substrate_tap:
@@ -225,7 +325,20 @@ def diff_pair(
 
 	component = component_snap_to_grid(rename_ports_by_orientation(diffpair))
 
-	component.info['netlist'] = diff_pair_netlist(fetL, fetR)
+	# Generate the diff_pair netlist
+	#diff_pair_netlist_obj = diff_pair_netlist(fetL, fetR)
+
+	# Store as string (same pattern as fet.py)
+	component.info['netlist'] = diff_pair_netlist_obj.generate_netlist()
+
+	# Optionally store netlist_data as JSON for reconstruction
+	component.info['netlist_data_json'] = json.dumps({
+		'circuit_name': diff_pair_netlist_obj.circuit_name,
+		'nodes': diff_pair_netlist_obj.nodes,
+		'source_netlist': diff_pair_netlist_obj.source_netlist,
+		'parameters': diff_pair_netlist_obj.parameters if hasattr(diff_pair_netlist_obj, 'parameters') else {}
+	})
+
 	return component
 
 
@@ -249,9 +362,9 @@ def diff_pair_generic(
 if __name__=="__main__":
 	diff_pair = add_df_labels(diff_pair(sky130_mapped_pdk),sky130_mapped_pdk)
 	#diff_pair = diff_pair(sky130_mapped_pdk)
-	diff_pair.show()
+	#diff_pair.show()
 	diff_pair.name = "DIFF_PAIR"
-	#magic_drc_result = sky130_mapped_pdk.drc_magic(diff_pair, diff_pair.name)
-	#netgen_lvs_result = sky130_mapped_pdk.lvs_netgen(diff_pair, diff_pair.name)
+	# magic_drc_result = sky130_mapped_pdk.drc_magic(diff_pair, diff_pair.name)
+	# netgen_lvs_result = sky130_mapped_pdk.lvs_netgen(diff_pair, diff_pair.name)
 	diff_pair_gds = diff_pair.write_gds("diff_pair.gds")
 	res = run_evaluation("diff_pair.gds", diff_pair.name, diff_pair)
